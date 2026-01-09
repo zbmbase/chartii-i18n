@@ -8,6 +8,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/zbmbase/chartii-i18n/releases)
 
 </div>
 
@@ -57,11 +58,6 @@ If you have successfully deployed CharTii-i18n for your project's multilingual s
 ### Step 1: Clone the Repository
 
 ```bash
-# Create a directory for the project (or navigate to your desired location)
-mkdir -p ~/projects
-cd ~/projects
-
-# Clone the repository
 git clone https://github.com/zbmbase/chartii-i18n.git
 cd chartii-i18n
 ```
