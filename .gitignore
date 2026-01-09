@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config with sensitive data (keep template)
+# Note: config/ directory may be created at runtime
+config/config.json
+
+# Backup files
+*.bak
+*.backup
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Legacy and deprecated code (excluded from development)
+**/deleted/
+
+# Tests (excluded from repository)
+tests/

@@ -1,0 +1,30 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="container py-5">
+  <div class="row justify-content-center">
+    <div class="col-md-8 col-lg-6">
+      <div class="card shadow-sm border-0">
+        <div class="card-body text-center py-5">
+          <div class="mb-4">
+            <i class="bi bi-exclamation-triangle text-warning" style="font-size: 4rem;"></i>
+          </div>
+          <h2 class="h3 mb-3">{{ error_title or t('errors.page_not_found_title') }}</h2>
+          <p class="text-muted mb-4">
+            {{ error_message or t('errors.page_not_found_message') }}
+          </p>
+          <a href="/" class="btn btn-primary">
+            <i class="bi bi-house me-2"></i>{{ t('errors.back_to_home') }}
+          </a>
+        </div>
+      </div>
+
+      {% if error_code %}
+      <div class="text-center mt-3">
+        <small class="text-muted">{{ t('errors.error_code') }} {{ error_code }}</small>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

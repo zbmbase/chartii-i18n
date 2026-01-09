@@ -1,0 +1,168 @@
+body {
+  background-color: #f8f9fb;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+#main-content {
+  flex: 1 0 auto;
+}
+
+/* Global checkbox and radio button sizing - 150% larger */
+.form-check-input {
+  width: 1.5rem;
+  height: 1.5rem;
+  cursor: pointer;
+  margin-top: 0.15rem;
+}
+
+/* Override Bootstrap's float for form-check inputs */
+.form-check .form-check-input {
+  text-align: left;
+  float: none;
+}
+
+/* Clickable labels for checkboxes and radio buttons */
+.form-check-label {
+  cursor: pointer;
+  user-select: none;
+  padding-left: 0.25rem;
+}
+
+/* Flex layout for form-check items */
+.form-check {
+  display: flex;
+  align-items: center;
+}
+
+/* Prevent validation green color on radio button labels */
+.was-validated .form-check-input:valid ~ .form-check-label,
+.form-check-input.is-valid ~ .form-check-label {
+  color: inherit;
+}
+
+.hero-badge {
+  max-width: 280px;
+  color: #212529;
+}
+
+.placeholder-row td {
+  background-color: #fff;
+}
+
+footer {
+  flex-shrink: 0;
+}
+
+#toast-stack {
+  z-index: 1100;
+  pointer-events: none;
+}
+
+#toast-stack .toast {
+  pointer-events: auto;
+}
+
+/* Settings modal provider config display - hide by default to prevent flash */
+.provider-config {
+  display: none;
+  margin-bottom: 1.5rem;
+}
+
+/* API Key password toggle button */
+.password-toggle {
+  border: none;
+  background: none;
+  padding: 0;
+  margin-right: 2rem;
+  cursor: pointer;
+  color: #6c757d; /* Bootstrap secondary color */
+  font-size: 1.1rem;
+  line-height: 1;
+  transition: color 0.2s;
+}
+
+.password-toggle:hover {
+  color: #495057; /* Darker on hover */
+}
+
+.password-toggle:focus {
+  outline: none;
+  box-shadow: none;
+}
+
+.password-toggle:active {
+  transform: scale(0.95);
+}
+
+/* Settings Modal - scrollable body */
+#settingsModal .modal-body {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+/* Source path column */
+.source-path-cell {
+  max-width: 400px;
+  word-break: break-all;
+  white-space: normal;
+}
+
+
+/* System settings modal - highlight active tab more clearly */
+#settings-tabs .nav-link.active {
+  background-color: #e9ecef;
+  color: #212529;
+  border-color: #dee2e6 #dee2e6 #fff;
+}
+
+/* Translation briefing log styles */
+.briefing-log {
+  max-height: 800px;
+  overflow-y: auto;
+  font-family: 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
+  font-size: 0.875rem;
+  background: #f8f9fa;
+  padding: 1rem;
+  border-radius: 0.5rem;
+  border: 1px solid #dee2e6;
+}
+
+.briefing-entry {
+  margin-bottom: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid #0d6efd;
+  background: #fff;
+  border-radius: 0 0.25rem 0.25rem 0;
+}
+
+.briefing-entry.success {
+  border-left-color: #198754;
+  background: #d1e7dd;
+}
+
+.briefing-entry.error {
+  border-left-color: #dc3545;
+  background: #f8d7da;
+}
+
+.briefing-entry.warning {
+  border-left-color: #ffc107;
+  background: #fff3cd;
+}
+
+.briefing-entry.info {
+  border-left-color: #0dcaf0;
+  background: #cff4fc;
+}
+
+/* Progress bar animation override for completion */
+.progress-bar:not(.progress-bar-animated) {
+  transition: width 0.3s ease-in-out;
+}
+
+/* Form switch input width */
+.form-switch .form-check-input {
+  width: 3em;
+}

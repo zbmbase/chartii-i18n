@@ -1,0 +1,25 @@
+# Legacy and deprecated code directories
+# These folders contain archived/abandoned code and should be excluded
+# from code search, autocomplete, and other development tools
+
+deleted/
+**/deleted/
+src/legacy_tui/
+tests/deleted/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+logs/
+
+# Virtual environment
+.venv/
+venv/
+

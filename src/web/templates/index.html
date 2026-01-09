@@ -1,0 +1,256 @@
+{% extends "layout.html" %} {% block content %}
+<section class="py-5 hero-section">
+  <div class="container">
+    <div class="row align-items-center gy-4">
+      <div class="col-lg-8">
+        <h1 class="display-5 fw-bold text-dark">{{ t('app.name') }}</h1>
+        <p class="lead text-dark">
+          {{ t('home.description') }}<br />
+          <strong>{{ t('home.how_it_works') }}</strong><br />
+          {{ t('home.how_it_works_description') }}
+        </p>
+      </div>
+      <div class="col-lg-4 text-center text-lg-end">
+        <div class="hero-badge text-dark bg-white border rounded-4 p-4">
+          <p class="mb-1 fw-semibold">{{ t('home.key_capabilities') }}</p>
+          <ul class="list-unstyled mb-0 small text-start">
+            <li>✔️ {{ t('home.capability_ai_translation') }}</li>
+            <li>✔️ {{ t('home.capability_auto_sync') }}</li>
+            <li>✔️ {{ t('home.capability_protected_terms') }}</li>
+            <li>✔️ {{ t('home.capability_fast_export') }}</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="py-5" id="projects-section">
+  <div class="container">
+    <div class="mb-4">
+      <button class="btn btn-secondary me-2" id="settings-btn">
+        ⚙️ {{ t('projects.settings_btn') }}
+      </button>
+      <button class="btn btn-success" id="create-project-btn">
+        + {{ t('projects.create_btn') }}
+      </button>
+    </div>
+
+    <div class="card shadow-sm">
+      <div class="card-body p-0">
+        <div class="table-responsive">
+          <table
+            class="table table-hover align-middle mb-0"
+            id="projects-table">
+            <thead class="table-light">
+              <tr>
+                <th scope="col">{{ t('projects.table.id') }}</th>
+                <th scope="col">{{ t('projects.table.name') }}</th>
+                <th scope="col">{{ t('projects.table.source_path') }}</th>
+                <th scope="col">{{ t('projects.table.language_count') }}</th>
+                <th scope="col" class="text-end">
+                  {{ t('projects.table.actions') }}
+                </th>
+              </tr>
+            </thead>
+            <tbody id="project-table-body">
+              {% if projects %} {% for project in projects %}
+              <tr data-project-id="{{ project.id }}">
+                <td>{{ project.id }}</td>
+                <td>{{ project.name }}</td>
+                <td
+                  class="font-monospace small source-path-cell"
+                  title="{{ project.source_file_path or '-' }}">
+                  {{ project.source_file_path or '-' }}
+                </td>
+                <td>
+                  <span
+                    class="language-count"
+                    data-project-id="{{ project.id }}"
+                    >-</span
+                  >
+                </td>
+                <td class="text-end">
+                  <div class="btn-group" role="group">
+                    <button
+                      class="btn btn-sm btn-primary manage-btn"
+                      data-project-id="{{ project.id }}">
+                      {{ t('common.manage') }}
+                    </button>
+                    <button
+                      class="btn btn-sm btn-secondary edit-btn"
+                      data-project-id="{{ project.id }}">
+                      {{ t('common.edit') }}
+                    </button>
+                    <button
+                      class="btn btn-sm btn-danger delete-btn"
+                      data-project-id="{{ project.id }}">
+                      {{ t('common.delete') }}
+                    </button>
+                  </div>
+                </td>
+              </tr>
+              {% endfor %} {% else %}
+              <tr class="placeholder-row">
+                <td colspan="5" class="text-center text-muted py-4">
+                  {{ t('projects.no_projects') }}
+                </td>
+              </tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div
+  class="modal fade"
+  id="createProjectModal"
+  tabindex="-1"
+  aria-labelledby="createProjectModalLabel"
+  aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="createProjectModalLabel">
+          {{ t('projects.create_modal.title') }}
+        </h5>
+        <button
+          type="button"
+          class="btn-close"
+          data-bs-dismiss="modal"
+          aria-label="Close"></button>
+      </div>
+      <form id="create-project-form" novalidate>
+        <div class="modal-body">
+          <div class="row g-3">
+            <div class="col-12">
+              <label for="project-name" class="form-label"
+                >{{ t('projects.create_modal.name_label') }}</label
+              >
+              <input
+                type="text"
+                class="form-control"
+                id="project-name"
+                name="name"
+                required />
+              <div class="invalid-feedback">
+                {{ t('projects.create_modal.name_required') }}
+              </div>
+            </div>
+            <div class="col-12">
+              <label for="source-file-path" class="form-label"
+                >{{ t('projects.create_modal.source_path_label') }}</label
+              >
+              <input
+                type="text"
+                class="form-control"
+                id="source-file-path"
+                name="source_file_path"
+                required />
+              <div class="form-text" id="source-file-help-create">
+                {{ t('projects.create_modal.source_path_help_create') }}<br />
+                {{ t('projects.create_modal.source_path_help_create2') }}
+              </div>
+              <div
+                class="form-text text-muted small d-none"
+                id="source-file-help-edit">
+                {{ t('projects.create_modal.source_path_help_edit') }}
+              </div>
+              <div class="invalid-feedback">
+                {{ t('projects.create_modal.source_path_required') }}
+              </div>
+              <div
+                class="small mt-1 d-none"
+                id="source-file-validation-message"></div>
+            </div>
+            <div class="col-12">
+              <label for="translation-context" class="form-label"
+                >{{ t('projects.create_modal.context_label') }}
+                <span class="text-muted small" id="translation-context-counter"
+                  >(0/1000)</span
+                ></label
+              >
+              <textarea
+                class="form-control"
+                id="translation-context"
+                name="translation_context"
+                rows="3"
+                required
+                placeholder="{{ t('projects.create_modal.context_placeholder') }}"
+                maxlength="1000"></textarea>
+              <div class="invalid-feedback">
+                {{ t('projects.create_modal.context_required') }}
+              </div>
+              <div class="form-text">
+                {{ t('projects.create_modal.context_help') }}
+              </div>
+            </div>
+            <div class="col-12" id="import-mode-section">
+              <label class="form-label d-block"
+                >{{ t('projects.create_modal.import_mode_label') }}</label
+              >
+              <div class="form-check py-2">
+                <input
+                  class="form-check-input"
+                  type="radio"
+                  name="import_mode"
+                  id="import-mode-retranslate"
+                  value="retranslate"
+                  checked />
+                <label class="form-check-label" for="import-mode-retranslate">
+                  <strong
+                    >{{ t('projects.create_modal.import_mode_retranslate')
+                    }}</strong
+                  >
+                  - {{ t('projects.create_modal.import_mode_retranslate_desc')
+                  }}
+                </label>
+              </div>
+              <div class="form-check py-2">
+                <input
+                  class="form-check-input"
+                  type="radio"
+                  name="import_mode"
+                  id="import-mode-merge"
+                  value="merge" />
+                <label class="form-check-label" for="import-mode-merge">
+                  <strong
+                    >{{ t('projects.create_modal.import_mode_merge') }}</strong
+                  >
+                  - {{ t('projects.create_modal.import_mode_merge_desc') }}
+                </label>
+              </div>
+              <div class="form-text">
+                {{ t('projects.create_modal.import_mode_help') }}
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button
+            type="button"
+            class="btn btn-secondary"
+            data-bs-dismiss="modal">
+            {{ t('common.cancel') }}
+          </button>
+          <button type="submit" class="btn btn-primary" id="submit-project-btn">
+            <span class="submit-label"
+              >{{ t('projects.create_modal.create_btn') }}</span
+            >
+            <span
+              class="spinner-border spinner-border-sm ms-2 d-none"
+              role="status"
+              aria-hidden="true"></span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{% endblock %} {% block scripts %}
+<script src="{{ url_for('static', filename='js/projects.js') }}"></script>
+{% endblock %}

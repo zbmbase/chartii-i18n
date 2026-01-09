@@ -1,0 +1,10 @@
+# CharTii-i18n Dependencies
+
+# Web Framework
+Flask>=3.0.0
+
+# HTTP Client for AI API calls
+httpx>=0.25.0
+
+# Testing (optional, for development)
+pytest>=7.0.0

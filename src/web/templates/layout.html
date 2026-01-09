@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="{{ current_lang or 'en' }}">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title or t('app.name') }}</title>
+    <link
+      href="{{ url_for('static', filename='vendor/bootstrap/bootstrap.min.css') }}"
+      rel="stylesheet" />
+    <link
+      href="{{ url_for('static', filename='vendor/bootstrap-icons/bootstrap-icons.css') }}"
+      rel="stylesheet" />
+    <link
+      href="{{ url_for('static', filename='css/main.css') }}"
+      rel="stylesheet" />
+  </head>
+  <body>
+    <nav class="navbar navbar-expand-lg bg-primary" data-bs-theme="light">
+      <div class="container">
+        <a class="navbar-brand fw-semibold text-dark" href="/"
+          ><i class="bi bi-translate me-2"></i>{{ t('app.name') }}</a
+        >
+        <button
+          class="navbar-toggler"
+          type="button"
+          data-bs-toggle="collapse"
+          data-bs-target="#navbarSupportedContent"
+          aria-controls="#navbarSupportedContent"
+          aria-expanded="false"
+          aria-label="{{ t('nav.toggle_navigation') }}">
+          <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="navbarSupportedContent">
+          <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+            <li class="nav-item">
+              <a class="nav-link active text-dark" aria-current="page" href="/"
+                >{{ t('nav.home') }}<span class="visually-hidden"
+                  >(current)</span
+                ></a
+              >
+            </li>
+            <li class="nav-item">
+              <a
+                class="nav-link text-dark"
+                href="https://github.com/zbmbase/chartii-i18n"
+                target="_blank"
+                rel="noopener"
+                >{{ t('nav.github') }}</a
+              >
+            </li>
+            <!-- Language Switcher -->
+            <li class="nav-item dropdown">
+              <a
+                class="nav-link dropdown-toggle text-dark"
+                href="#"
+                role="button"
+                data-bs-toggle="dropdown"
+                aria-expanded="false">
+                <i class="bi bi-globe me-1"></i>
+                {{ supported_languages[current_lang].native_name if current_lang
+                in supported_languages else 'English' }}
+              </a>
+              <ul class="dropdown-menu dropdown-menu-end">
+                {% for lang_code, lang_info in supported_languages.items() %}
+                <li>
+                  <a
+                    class="dropdown-item{% if lang_code == current_lang %} active{% endif %}"
+                    href="#"
+                    onclick="switchLanguage('{{ lang_code }}'); return false;">
+                    {{ lang_info.native_name }}
+                    <span class="text-muted small ms-2"
+                      >({{ lang_info.name }})</span
+                    >
+                  </a>
+                </li>
+                {% endfor %}
+              </ul>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </nav>
+
+    <div
+      class="toast-container position-fixed top-0 end-0 p-3"
+      id="toast-stack"
+      aria-live="polite"
+      aria-atomic="true"></div>
+
+    <main class="flex-shrink-0" id="main-content">
+      {% block content %}{% endblock %}
+    </main>
+
+    <footer class="bg-dark text-light py-4 mt-auto">
+      <div class="container text-center small">
+        <div>© {{ current_year or 2026 }} {{ t('app.name') }}</div>
+      </div>
+    </footer>
+
+    <!-- Settings Modal -->
+    <div
+      class="modal fade"
+      id="settingsModal"
+      tabindex="-1"
+      aria-labelledby="settingsModalLabel"
+      aria-hidden="true">
+      <div class="modal-dialog modal-dialog-centered modal-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="settingsModalLabel">
+              {{ t('settings.title') }}
+            </h5>
+            <button
+              type="button"
+              class="btn-close"
+              data-bs-dismiss="modal"
+              aria-label="Close"></button>
+          </div>
+          <form id="settings-form">
+            <div class="modal-body">
+              <!-- Settings Tabs -->
+              <ul class="nav nav-tabs mb-3" id="settings-tabs" role="tablist">
+                <li class="nav-item" role="presentation">
+                  <button
+                    class="nav-link active"
+                    id="settings-api-tab"
+                    data-bs-toggle="tab"
+                    data-bs-target="#settings-api"
+                    type="button"
+                    role="tab"
+                    aria-controls="settings-api"
+                    aria-selected="true">
+                    {{ t('settings.tabs.api') }}
+                  </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                  <button
+                    class="nav-link"
+                    id="settings-general-tab"
+                    data-bs-toggle="tab"
+                    data-bs-target="#settings-general"
+                    type="button"
+                    role="tab"
+                    aria-controls="settings-general"
+                    aria-selected="false">
+                    {{ t('settings.tabs.general') }}
+                  </button>
+                </li>
+              </ul>
+
+              <div class="tab-content">
+                <!-- API Settings Tab -->
+                <div
+                  class="tab-pane fade show active"
+                  id="settings-api"
+                  role="tabpanel"
+                  aria-labelledby="settings-api-tab">
+                  <!-- AI Provider Selection -->
+                  <div class="mb-4">
+                    <label for="ai-provider" class="form-label"
+                      >{{ t('settings.api.provider_label') }}</label
+                    >
+                    <select
+                      class="form-select"
+                      id="ai-provider"
+                      name="ai_provider"
+                      required>
+                      <!-- Built-in providers will be dynamically populated by JS -->
+                      <optgroup
+                        label="{{ t('settings.api.custom_providers') }}"
+                        id="custom-providers-group"></optgroup>
+                      <option value="__add_new__">
+                        {{ t('settings.api.add_new_provider') }}
+                      </option>
+                    </select>
+                    <div class="form-text">
+                      {{ t('settings.api.provider_help') }}
+                    </div>
+                  </div>
+
+                  <!-- Custom Providers Container -->
+                  <!-- Provider Configs Container (generated by JS) -->
+                  <div id="built-in-providers-container"></div>
+                  <div id="custom-providers-container"></div>
+
+                  <!-- Unified Provider Config Template (supports all scenarios) -->
+                  <template id="provider-config-template">
+                    <div
+                      class="provider-config"
+                      data-provider="__PROVIDER_PREFIX__"
+                      id="__PROVIDER_PREFIX__-config">
+                      <!-- Header: supports optional delete button and custom title -->
+                      <div class="__HEADER_STYLE__">
+                        <h6 class="__TITLE_STYLE__">
+                          <span class="provider-display-name"
+                            >__PROVIDER_DISPLAY_NAME__</span
+                          >
+                          __TITLE_SUFFIX__
+                        </h6>
+                        __DELETE_BUTTON__
+                      </div>
+                      <div class="row g-3">
+                        <!-- Optional Provider Name field (only for new providers) -->
+                        __PROVIDER_NAME_FIELD__
+                        <!-- API URL -->
+                        <div class="col-12">
+                          <label
+                            for="__PROVIDER_PREFIX__-api-url"
+                            class="form-label"
+                            >API URL__API_URL_REQUIRED__</label
+                          >
+                          <input
+                            type="url"
+                            class="form-control"
+                            id="__PROVIDER_PREFIX__-api-url"
+                            name="__PROVIDER_PREFIX__-api-url"
+                            placeholder="__API_URL_PLACEHOLDER__" />
+                          <div class="form-text">
+                            API endpoint URL for __API_URL_DESCRIPTION__.
+                          </div>
+                        </div>
+                        <!-- API Key -->
+                        <div class="col-12">
+                          <label
+                            for="__PROVIDER_PREFIX__-api-key"
+                            class="form-label"
+                            >API Key *</label
+                          >
+                          <div class="position-relative">
+                            <input
+                              type="password"
+                              class="form-control pe-5"
+                              id="__PROVIDER_PREFIX__-api-key"
+                              name="__PROVIDER_PREFIX__-api-key"
+                              placeholder="sk-..." />
+                            <button
+                              class="password-toggle position-absolute end-0 top-50 translate-middle-y"
+                              type="button"
+                              onclick="togglePasswordVisibility('__PROVIDER_PREFIX__-api-key', this)"
+                              title="Show/Hide API Key">
+                              <i class="bi bi-eye-fill"></i>
+                            </button>
+                          </div>
+                          <div
+                            class="form-text"
+                            id="__PROVIDER_PREFIX__-api-key-hint">
+                            Your __API_KEY_HINT_TEXT__ API key. Keep it secure.
+                          </div>
+                        </div>
+                        <!-- Models -->
+                        <div class="col-12">
+                          <label class="form-label">Models</label>
+                          <div class="d-flex flex-column gap-2">
+                            <input
+                              type="text"
+                              class="form-control"
+                              style="width: 40%"
+                              id="__PROVIDER_PREFIX__-model-1"
+                              name="__PROVIDER_PREFIX__-model-1"
+                              placeholder="Model 1" />
+                            <input
+                              type="text"
+                              class="form-control"
+                              style="width: 40%"
+                              id="__PROVIDER_PREFIX__-model-2"
+                              name="__PROVIDER_PREFIX__-model-2"
+                              placeholder="Model 2" />
+                            <input
+                              type="text"
+                              class="form-control"
+                              style="width: 40%"
+                              id="__PROVIDER_PREFIX__-model-3"
+                              name="__PROVIDER_PREFIX__-model-3"
+                              placeholder="Model 3" />
+                            <input
+                              type="text"
+                              class="form-control"
+                              style="width: 40%"
+                              id="__PROVIDER_PREFIX__-model-4"
+                              name="__PROVIDER_PREFIX__-model-4"
+                              placeholder="Model 4" />
+                            <input
+                              type="text"
+                              class="form-control"
+                              style="width: 40%"
+                              id="__PROVIDER_PREFIX__-model-5"
+                              name="__PROVIDER_PREFIX__-model-5"
+                              placeholder="Model 5" />
+                          </div>
+                        </div>
+                        <!-- Set as Default button -->
+                        <div class="col-12 mt-2">
+                          <button
+                            type="button"
+                            class="btn btn-sm btn-secondary"
+                            onclick="resetProviderToDefault('__PROVIDER_PREFIX__')">
+                            Set as Default
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </template>
+                </div>
+
+                <!-- General Settings Tab -->
+                <div
+                  class="tab-pane fade"
+                  id="settings-general"
+                  role="tabpanel"
+                  aria-labelledby="settings-general-tab">
+                  <div class="mb-3">
+                    <span class="form-label d-block mb-1"
+                      >{{ t('settings.general.log_mode_label') }}</span
+                    >
+                    <div class="form-check">
+                      <input
+                        class="form-check-input"
+                        type="radio"
+                        name="log_mode"
+                        id="log-mode-off"
+                        value="off" />
+                      <label class="form-check-label" for="log-mode-off">
+                        {{ t('settings.general.log_mode_off') }}
+                      </label>
+                    </div>
+                    <div class="form-check">
+                      <input
+                        class="form-check-input"
+                        type="radio"
+                        name="log_mode"
+                        id="log-mode-debug"
+                        value="debug" />
+                      <label class="form-check-label" for="log-mode-debug">
+                        {{ t('settings.general.log_mode_debug') }}
+                      </label>
+                    </div>
+                    <div class="form-text mt-1">
+                      {{ t('settings.general.log_mode_help') }}
+                    </div>
+                    <div class="mt-3">
+                      <button
+                        type="button"
+                        class="btn btn-danger btn-sm"
+                        id="clear-logs-btn">
+                        <i class="bi bi-trash me-1"></i> {{
+                        t('settings.general.clear_logs_btn') }}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="modal-footer">
+              <button
+                type="button"
+                class="btn btn-secondary"
+                data-bs-dismiss="modal">
+                {{ t('common.cancel') }}
+              </button>
+              <button
+                type="submit"
+                class="btn btn-primary"
+                id="submit-settings-btn">
+                <span class="submit-settings-label"
+                  >{{ t('settings.buttons.save') }}</span
+                >
+                <span
+                  class="spinner-border spinner-border-sm ms-2 d-none"
+                  role="status"
+                  aria-hidden="true"></span>
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='vendor/bootstrap/bootstrap.bundle.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/settings.js') }}"></script>
+    <script>
+      // Language switching function
+      window.switchLanguage = function (langCode) {
+        // Save to localStorage
+        localStorage.setItem("lang", langCode);
+        // Set cookie for server-side detection
+        document.cookie = "lang=" + langCode + ";path=/;max-age=31536000"; // 1 year
+        // Reload the page to apply the new language
+        window.location.reload();
+      };
+
+      // Store current language for JavaScript access
+      window.currentLang = "{{ current_lang }}";
+
+      // Global function to open settings modal - available to all pages
+      window.openSystemSettingsModal = function () {
+        const settingsModalEl = document.getElementById("settingsModal");
+        if (settingsModalEl && window.bootstrap) {
+          // Get or create Bootstrap modal instance
+          let settingsModal = bootstrap.Modal.getInstance(settingsModalEl);
+          if (!settingsModal) {
+            settingsModal = new bootstrap.Modal(settingsModalEl, {
+              backdrop: "static",
+              keyboard: false,
+            });
+          }
+
+          // Show the modal
+          settingsModal.show();
+
+          // Switch to API Settings tab if it exists
+          setTimeout(() => {
+            const apiTab = document.getElementById("settings-api-tab");
+            if (apiTab) {
+              const tab = new bootstrap.Tab(apiTab);
+              tab.show();
+            }
+          }, 100);
+        } else {
+          console.error(
+            "Settings modal not available. Make sure Bootstrap is loaded."
+          );
+        }
+      };
+    </script>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>
