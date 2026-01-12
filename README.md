@@ -22,7 +22,7 @@ CharTii-i18n is a comprehensive web-based toolkit that streamlines the end-to-en
 
 The following projects are using CharTii-i18n for their internationalization:
 
-- **[Pixabc](https://pixabc.com)** - Online image processing tool
+- **[Pixabc](https://pixabc.com)** - Free Online Image Tools
 
 If you have successfully deployed CharTii-i18n for your project's multilingual support, we'd love to hear from you! Please [share your project in Discussions](https://github.com/zbmbase/chartii-i18n/discussions) and we'll add it to this list.
 
@@ -389,6 +389,9 @@ chartii-i18n/
 │   │   ├── static/       # CSS, JS, and assets
 │   │   └── locales/      # UI translations
 │   ├── ai/               # AI service integration
+│   │   ├── service.py    # AI service wrapper and translation logic
+│   │   ├── providers.py  # AI provider API implementations
+│   │   └── exceptions.py # AI-related exceptions
 │   ├── core/             # Core functionality
 │   │   ├── database.py   # SQLite database layer
 │   │   ├── sync.py       # File synchronization
