@@ -11,6 +11,7 @@ from src.core import database as db
 from src.core import sync
 from src.core import validation
 from src.logger import get_logger
+from src.translation.protected_invalidation import invalidate_translations_for_protected_terms
 import src.language_codes as lc
 from src.project import generator as file_generator
 from src import i18n
@@ -81,6 +82,26 @@ def sync_project_endpoint(project_id: int):
         len(result.deleted_strings),
     )
 
+    protected_invalidation: Dict[str, Any] = {
+        "skipped": True,
+        "deleted": 0,
+        "reasons": {},
+    }
+    try:
+        protected_invalidation = invalidate_translations_for_protected_terms(project_id)
+    except Exception as exc:
+        logger.exception(
+            "Protected-term invalidation failed after sync for project %s: %s",
+            project_id,
+            exc,
+        )
+        protected_invalidation = {
+            "skipped": True,
+            "deleted": 0,
+            "reasons": {},
+            "error": str(exc),
+        }
+
     response_payload = _format_sync_response(
         project_id=project_id,
         source_file=str(source_file_path),
@@ -88,6 +109,7 @@ def sync_project_endpoint(project_id: int):
         preview=preview,
         dry_run=False,
     )
+    response_payload["protected_invalidation"] = protected_invalidation
     return jsonify(response_payload)
 
 

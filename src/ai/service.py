@@ -295,6 +295,10 @@ class AIService:
         if '401' in str(error) or '403' in str(error) or 'unauthorized' in error_str or 'forbidden' in error_str:
             return False, 0
 
+        # Billing/Quota errors (402) - don't retry
+        if '402' in str(error) or 'insufficient balance' in error_str or 'quota exceeded' in error_str:
+            return False, 0
+
         # Invalid request (400) - don't retry
         if '400' in str(error) and ('invalid' in error_str or 'bad request' in error_str):
             return False, 0

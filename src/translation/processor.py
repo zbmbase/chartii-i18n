@@ -15,6 +15,29 @@ from src.translation.progress import TranslationProgress
 logger = get_logger(__name__)
 
 
+def _is_fatal_translation_error(error: Exception) -> bool:
+    """
+    Identify non-recoverable translation errors that should fail fast.
+
+    These errors indicate configuration/account issues and should stop the job
+    instead of falling back to source text, which leads to mass
+    "identical_to_source" validation failures.
+    """
+    error_str = str(error).lower()
+    fatal_markers = (
+        "401",
+        "403",
+        "402",
+        "unauthorized",
+        "forbidden",
+        "insufficient balance",
+        "quota exceeded",
+        "api key not configured",
+        "configuration not found",
+    )
+    return any(marker in error_str for marker in fatal_markers)
+
+
 def translate_chunks_sequential_with_progress(
     chunks: List[List[tuple]],
     source_lang: str,
@@ -112,6 +135,14 @@ def translate_chunks_sequential_with_progress(
                         results.append([text for _, text in remaining_chunk])
                     break
         except Exception as e:
+            if _is_fatal_translation_error(e):
+                logger.error(
+                    "Chunk %s/%s encountered fatal translation error: %s",
+                    chunk_idx + 1,
+                    len(chunks),
+                    e,
+                )
+                raise
             logger.error(f"Chunk {chunk_idx + 1}/{len(chunks)} translation failed: {e}. Returning originals.")
             results.append(texts)  # Graceful fallback
 
@@ -194,6 +225,14 @@ def translate_chunks_sequential(
             logger.debug(f"Chunk {chunk_idx + 1}/{len(chunks)}: Translation completed")
             results.append(translated)
         except Exception as e:
+            if _is_fatal_translation_error(e):
+                logger.error(
+                    "Chunk %s/%s encountered fatal translation error: %s",
+                    chunk_idx + 1,
+                    len(chunks),
+                    e,
+                )
+                raise
             logger.error(f"Chunk {chunk_idx + 1}/{len(chunks)} translation failed: {e}. Returning originals.")
             results.append(texts)  # Graceful fallback
 
