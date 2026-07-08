@@ -199,7 +199,10 @@
       case "checking":
         LPM.translate.addBriefing(
           "info",
-          `Checking ${langName} (${langCode})...`
+          `[${langName}] Checking for pending translations...`,
+          null,
+          false,
+          langCode
         );
         break;
 
@@ -209,7 +212,10 @@
         const missingKeys = progressItem.failure_count || 0;
         LPM.translate.addBriefing(
           "info",
-          `Total: ${totalKeys}, Completed: ${completedKeys}, Missing: ${missingKeys}`
+          `[${langName}] Checked: Total Keys: ${totalKeys}, Completed: ${completedKeys}, Missing: ${missingKeys}`,
+          null,
+          false,
+          langCode
         );
         break;
 
@@ -225,32 +231,38 @@
           if (missingCount > 0) {
             LPM.translate.addBriefing(
               "info",
-              `${missingCount} missing entr${
-                missingCount !== 1 ? "ies" : "y"
-              } will be translated`
+              `[${langName}] ${missingCount} missing entry/entries will be translated`,
+              null,
+              false,
+              langCode
             );
           }
         } else if (mode === "missing_and_ai") {
           if (missingCount > 0) {
             LPM.translate.addBriefing(
               "info",
-              `${missingCount} missing entr${
-                missingCount !== 1 ? "ies" : "y"
-              } will be translated`
+              `[${langName}] ${missingCount} missing entry/entries will be translated`,
+              null,
+              false,
+              langCode
             );
           }
           if (lockedCount > 0) {
             LPM.translate.addBriefing(
               "info",
-              `Manual translated (locked): ${lockedCount}`
+              `[${langName}] Manual translated (locked): ${lockedCount}`,
+              null,
+              false,
+              langCode
             );
           }
           if (aiCount > 0) {
             LPM.translate.addBriefing(
               "info",
-              `${aiCount} AI-generated entr${
-                aiCount !== 1 ? "ies" : "y"
-              } will be re-translated`
+              `[${langName}] ${aiCount} AI-generated entry/entries will be re-translated`,
+              null,
+              false,
+              langCode
             );
           }
         } else if (mode === "full") {
@@ -259,18 +271,20 @@
               lockedCount > 0 ? ` (${lockedCount} locked)` : "";
             LPM.translate.addBriefing(
               "info",
-              `${totalTasks} entr${
-                totalTasks !== 1 ? "ies" : "y"
-              } will be translated${lockedText}`
+              `[${langName}] ${totalTasks} entry/entries will be translated${lockedText}`,
+              null,
+              false,
+              langCode
             );
           }
         } else if (mode === "validate_only") {
           if (totalTasks > 0) {
             LPM.translate.addBriefing(
               "info",
-              `${totalTasks} entr${
-                totalTasks !== 1 ? "ies" : "y"
-              } will be validated`
+              `[${langName}] ${totalTasks} entry/entries will be validated`,
+              null,
+              false,
+              langCode
             );
           }
         }
@@ -282,23 +296,38 @@
         if (noWorkMode === "missing_only") {
           LPM.translate.addBriefing(
             "info",
-            `No missing entries. Skipping ${langName} (${langCode}).`
+            `[${langName}] No missing entries. Skipping.`,
+            null,
+            false,
+            langCode
           );
         } else if (noWorkMode === "validate_only") {
           LPM.translate.addBriefing(
             "info",
-            `No translations to validate. Skipping ${langName} (${langCode}).`
+            `[${langName}] No translations to validate. Skipping.`,
+            null,
+            false,
+            langCode
           );
         } else {
           LPM.translate.addBriefing(
             "success",
-            `All translations complete for ${langName} (${langCode}).`
+            `[${langName}] All translations complete.`,
+            null,
+            false,
+            langCode
           );
         }
         break;
 
       case "file_generated":
-        LPM.translate.addBriefing("success", `Generated: ${langCode}.json`);
+        LPM.translate.addBriefing(
+          "success",
+          `[${langName}] Generated: ${langCode}.json`,
+          null,
+          false,
+          langCode
+        );
         break;
 
       case "starting":
@@ -310,10 +339,13 @@
             : t("manage.translate.messages.translating");
         LPM.translate.addBriefing(
           "info",
-          `${actionText} ${langName} (${langCode})...`
+          `[${langName}] ${actionText}...`,
+          null,
+          false,
+          langCode
         );
 
-        // Simple progress calculation: based on languages only
+        // Simple progress calculation: based on completed languages only to avoid jumping back and forth
         let startingPercent = 0;
         if (progressItem.total_languages > 0) {
           startingPercent = Math.round(
@@ -325,7 +357,7 @@
 
         LPM.translate.updateProgress(
           startingPercent,
-          `${actionText} ${langName} (${langCode})...`
+          `${actionText}... (${progressItem.completed_languages}/${progressItem.total_languages})`
         );
         state.translate.lastProgressPercent = startingPercent;
         state.translate.lastLanguage = langCode;
@@ -357,7 +389,10 @@
           }
           LPM.translate.addBriefing(
             "info",
-            `Batch ${progressItem.current_batch}/${progressItem.total_batches} done${keysInfo}${tokenInfo}`
+            `[${langName}] Batch ${progressItem.current_batch}/${progressItem.total_batches} done${keysInfo}${tokenInfo}`,
+            null,
+            false,
+            langCode
           );
 
           if (
@@ -366,39 +401,21 @@
             state.translate.currentBatch = progressItem.current_batch;
           }
 
-          // Simple progress calculation: based on languages and batches
+          // Simple progress calculation: strictly based on completed languages to prevent jumping back and forth
           let overallPercent = 0;
-          if (
-            progressItem.total_languages > 0 &&
-            progressItem.total_batches > 0
-          ) {
-            // Progress = (completed languages + current language batch progress) / total languages
-            const completedLanguageProgress =
-              progressItem.completed_languages / progressItem.total_languages;
-            const currentLanguageBatchProgress =
-              progressItem.current_batch / progressItem.total_batches;
-            const currentLanguageProgress =
-              currentLanguageBatchProgress / progressItem.total_languages;
+          if (progressItem.total_languages > 0) {
             overallPercent = Math.round(
-              (completedLanguageProgress + currentLanguageProgress) * 100
-            );
-            overallPercent = Math.max(0, Math.min(100, overallPercent));
-          } else if (progressItem.total_languages > 0) {
-            // Fallback: only use completed languages if batch info is not available
-            overallPercent = Math.round(
-              (progressItem.completed_languages /
-                progressItem.total_languages) *
-                100
+              (progressItem.completed_languages / progressItem.total_languages) * 100
             );
             overallPercent = Math.max(0, Math.min(100, overallPercent));
           }
 
           if (progressItem.total_batches > 0) {
             const isValidating = state.translate.mode === "validate_only";
-            const actionText = isValidating
+            const actionText2 = isValidating
               ? t("manage.translate.messages.validating")
               : t("manage.translate.messages.translating");
-            const statusText = `${actionText} ${langName} (${langCode}) - Batch ${progressItem.current_batch}/${progressItem.total_batches}...`;
+            const statusText = `${actionText2}... (${progressItem.completed_languages}/${progressItem.total_languages})`;
             LPM.translate.updateProgress(overallPercent, statusText);
             state.translate.lastProgressPercent = overallPercent;
           }
@@ -1169,7 +1186,10 @@
         ) {
           LPM.translate.addBriefing(
             "warning",
-            `Retrying ${progress.retry_keys_count} failed keys...`
+            `[${langName}] Retrying ${progress.retry_keys_count} failed keys...`,
+            null,
+            false,
+            langCode
           );
           state.translate.currentPhase = "retrying";
           // Skip progress update entirely for retrying phase
@@ -1190,9 +1210,13 @@
               percent = Math.max(0, Math.min(100, percent));
             }
           }
+          const isValidating = state.translate.mode === "validate_only";
+          const actionText = isValidating
+            ? t("manage.translate.messages.validating")
+            : t("manage.translate.messages.translating");
           LPM.translate.updateProgress(
             percent,
-            `Saving translations for ${langName}...`
+            `${actionText}... (${progress.completed_languages}/${progress.total_languages})`
           );
         }
 

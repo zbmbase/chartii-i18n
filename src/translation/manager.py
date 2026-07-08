@@ -9,8 +9,10 @@ Main TranslationManager class that coordinates the translation workflow:
 """
 
 import time
+import threading
 from typing import Any, Callable, Dict, List, Optional
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.core import database as db
 from src.core import validation
@@ -19,6 +21,8 @@ from src.protection import apply_protection, restore_protection, get_all_protect
 from src.logger import get_logger
 import src.language_codes as lc
 from src.config import DEFAULT_CHUNK_SIZE_WORDS, load_config
+
+DEFAULT_LANGUAGE_CONCURRENCY = 100
 
 from src.translation.progress import TranslationProgress
 from src.translation.validator import (
@@ -33,8 +37,89 @@ from src.translation.processor import (
     replace_variables_with_placeholders,
     restore_variables_from_placeholders,
 )
+from src.translation.db_queue import db_writer
 
 logger = get_logger(__name__)
+
+
+class _TranslationJobContext:
+    """Thread-safe shared state for concurrent per-language translation."""
+
+    def __init__(self, total_items: int = 0):
+        self.lock = threading.Lock()
+        self.completed_languages = 0
+        self.translated_count = 0
+        self.failure_count = 0
+        self.processed_items = 0
+        self.total_items = total_items
+        self.failed_items: List[Dict[str, Any]] = []
+        self.generated_files: Dict[str, str] = {}
+        self.total_token_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        self.cancelled = False
+        self.fatal_error: Optional[Exception] = None
+
+    def is_cancelled(self) -> bool:
+        with self.lock:
+            return self.cancelled
+
+    def request_cancel(self) -> None:
+        with self.lock:
+            self.cancelled = True
+
+    def set_fatal_error(self, error: Exception) -> None:
+        with self.lock:
+            self.fatal_error = error
+            self.cancelled = True
+
+    def get_fatal_error(self) -> Optional[Exception]:
+        with self.lock:
+            return self.fatal_error
+
+    def get_completed_languages(self) -> int:
+        with self.lock:
+            return self.completed_languages
+
+    def increment_completed_languages(self) -> int:
+        with self.lock:
+            self.completed_languages += 1
+            return self.completed_languages
+
+    def add_translated(self, count: int = 1) -> int:
+        with self.lock:
+            self.translated_count += count
+            return self.translated_count
+
+    def add_failure(self, count: int = 1) -> int:
+        with self.lock:
+            self.failure_count += count
+            return self.failure_count
+
+    def add_processed_items(self, count: int = 1) -> int:
+        with self.lock:
+            self.processed_items += count
+            return self.processed_items
+
+    def get_counts(self) -> Dict[str, int]:
+        with self.lock:
+            return {
+                "translated_count": self.translated_count,
+                "failure_count": self.failure_count,
+                "processed_items": self.processed_items,
+                "completed_languages": self.completed_languages,
+            }
+
+    def append_failed_item(self, item: Dict[str, Any]) -> None:
+        with self.lock:
+            self.failed_items.append(item)
+
+    def add_token_usage(self, usage: Dict[str, int]) -> None:
+        with self.lock:
+            self.total_token_usage["prompt_tokens"] += usage.get("prompt_tokens", 0)
+            self.total_token_usage["completion_tokens"] += usage.get("completion_tokens", 0)
+
+    def set_generated_file(self, lang_code: str, path: str) -> None:
+        with self.lock:
+            self.generated_files[lang_code] = path
 
 
 class TranslationManager:
@@ -350,6 +435,676 @@ class TranslationManager:
 
         return result
 
+    def _translate_single_language(
+        self,
+        lang_code: str,
+        lang_idx: int,
+        total_languages: int,
+        ctx: _TranslationJobContext,
+        mode: str,
+        include_locked: bool,
+        generate_files: bool,
+        source_language: str,
+        context: str,
+        locales_path: Path,
+        chunk_size_words: Optional[int],
+        model_override: Optional[str],
+        ai_provider: Optional[str],
+        progress_callback: Optional[Callable[[TranslationProgress], None]],
+        cancel_check: Optional[Callable[[], bool]],
+    ) -> None:
+        """Translate all pending items for a single target language (concurrent worker thread)."""
+        from src.translation.utils import chunk_with_keys
+        import src.project.generator as file_generator
+
+        # Initialize thread-local AI service to ensure thread safety
+        ai_service = AIService(model_override=model_override, provider_override=ai_provider)
+        lang_name = lc.get_language_name(lang_code) or lang_code
+
+        # Helper to check cancellation
+        def _should_stop() -> bool:
+            if ctx.is_cancelled():
+                return True
+            if cancel_check and cancel_check():
+                ctx.request_cancel()
+                return True
+            return False
+
+        # Helper to report progress thread-safely
+        def _report(progress: TranslationProgress) -> bool:
+            if not progress_callback:
+                return False
+            # Fill shared counts
+            counts = ctx.get_counts()
+            progress.completed_languages = counts["completed_languages"]
+            progress.current_item = counts["processed_items"]
+            if progress.phase in {"completed", "file_generated", "batch_done"}:
+                progress.success_count = counts["translated_count"]
+                progress.failure_count = counts["failure_count"]
+            if progress_callback(progress):
+                ctx.request_cancel()
+                return True
+            return False
+
+        if _should_stop():
+            return
+
+        # Phase 1: Send "checking" progress
+        logger.info(f"Checking {lang_name} ({lang_code}) for pending translations...")
+        if progress_callback:
+            progress = TranslationProgress(
+                current_language=lang_code,
+                current_language_name=lang_name,
+                total_languages=total_languages,
+                completed_languages=ctx.get_completed_languages(),
+                current_item=ctx.get_counts()["processed_items"],
+                total_items=ctx.total_items,
+                current_key="",
+                current_text="",
+                success_count=ctx.get_counts()["translated_count"],
+                failure_count=ctx.get_counts()["failure_count"],
+                current_batch=0,
+                total_batches=0,
+                batch_keys_count=0,
+                phase="checking",
+            )
+            if _report(progress):
+                return
+
+        # Phase 2: Check for pending tasks
+        tasks = self._get_tasks_for_language(lang_code, mode=mode, include_locked=include_locked)
+
+        # Get language statistics for briefing
+        try:
+            lang_stats = validation.get_translation_stats(self.project_id, lang_code)
+            total_keys = lang_stats.total_strings
+            completed_keys = lang_stats.translated_count
+            missing_keys = lang_stats.missing_count
+        except Exception as e:
+            logger.warning(f"Failed to get stats for {lang_code}: {e}")
+            total_keys = len(tasks) if tasks else 0
+            completed_keys = 0
+            missing_keys = len(tasks) if tasks else 0
+
+        # Send "checked" phase with statistics
+        logger.info(f"Checked {lang_name} ({lang_code}): Total: {total_keys}, Completed: {completed_keys}, Missing: {missing_keys}")
+        if progress_callback:
+            progress = TranslationProgress(
+                current_language=lang_code,
+                current_language_name=lang_name,
+                total_languages=total_languages,
+                completed_languages=ctx.get_completed_languages(),
+                current_item=ctx.get_counts()["processed_items"],
+                total_items=total_keys,
+                current_key="",
+                current_text="",
+                success_count=completed_keys,
+                failure_count=missing_keys,
+                current_batch=0,
+                total_batches=0,
+                batch_keys_count=0,
+                phase="checked",
+                mode=mode,
+            )
+            if _report(progress):
+                return
+
+        if not tasks:
+            # No tasks for this language
+            logger.info(f"No pending translations for {lang_code}")
+            logger.info(f"All translations complete for {lang_name} ({lang_code})")
+
+            task_stats = self._get_task_statistics(lang_code, mode=mode, include_locked=include_locked)
+
+            # Send "no_work" progress
+            if progress_callback:
+                progress = TranslationProgress(
+                    current_language=lang_code,
+                    current_language_name=lang_name,
+                    total_languages=total_languages,
+                    completed_languages=ctx.get_completed_languages(),
+                    current_item=ctx.get_counts()["processed_items"],
+                    total_items=ctx.total_items,
+                    current_key="",
+                    current_text="",
+                    success_count=ctx.get_counts()["translated_count"],
+                    failure_count=ctx.get_counts()["failure_count"],
+                    current_batch=0,
+                    total_batches=0,
+                    batch_keys_count=0,
+                    phase="no_work",
+                    missing_count=task_stats["missing_count"],
+                    ai_count=task_stats["ai_count"],
+                    locked_count=task_stats["locked_count"],
+                    total_tasks=task_stats["total_tasks"],
+                    mode=mode,
+                )
+                if _report(progress):
+                    return
+
+            completed_count = ctx.increment_completed_languages()
+
+            # Generate file for this language
+            if generate_files:
+                try:
+                    logger.info(f"Generating language file for {lang_name} ({lang_code})...")
+                    output_path = locales_path / f"{lang_code}.json"
+                    file_generator.generate_language_file(self.project_id, lang_code, output_path)
+                    ctx.set_generated_file(lang_code, str(output_path))
+                    logger.info(f"Generated file for {lang_code}: {output_path}")
+
+                    if progress_callback:
+                        progress = TranslationProgress(
+                            current_language=lang_code,
+                            current_language_name=lang_name,
+                            total_languages=total_languages,
+                            completed_languages=completed_count,
+                            current_item=ctx.get_counts()["processed_items"],
+                            total_items=ctx.total_items,
+                            current_key="",
+                            current_text="",
+                            success_count=ctx.get_counts()["translated_count"],
+                            failure_count=ctx.get_counts()["failure_count"],
+                            current_batch=0,
+                            total_batches=0,
+                            batch_keys_count=0,
+                            phase="file_generated",
+                        )
+                        _report(progress)
+                except Exception as e:
+                    logger.error(f"Failed to generate file for {lang_code}: {e}")
+
+            # Send "completed" phase for no_work case
+            if progress_callback:
+                progress = TranslationProgress(
+                    current_language=lang_code,
+                    current_language_name=lang_name,
+                    total_languages=total_languages,
+                    completed_languages=completed_count,
+                    current_item=ctx.get_counts()["processed_items"],
+                    total_items=ctx.total_items,
+                    current_key="",
+                    current_text="",
+                    success_count=0,
+                    failure_count=0,
+                    current_batch=0,
+                    total_batches=0,
+                    batch_keys_count=0,
+                    phase="completed",
+                )
+                _report(progress)
+
+            return
+
+        # Has tasks - proceed with translation
+        tasks_count = len(tasks)
+
+        task_stats = self._get_task_statistics(lang_code, mode=mode, include_locked=include_locked)
+
+        # Send "tasks_found" phase
+        logger.info(f"Found {tasks_count} keys to translate for {lang_name} ({lang_code})")
+        if progress_callback:
+            progress = TranslationProgress(
+                current_language=lang_code,
+                current_language_name=lang_name,
+                total_languages=total_languages,
+                completed_languages=ctx.get_completed_languages(),
+                current_item=ctx.get_counts()["processed_items"],
+                total_items=tasks_count,
+                current_key="",
+                current_text="",
+                success_count=0,
+                failure_count=0,
+                current_batch=0,
+                total_batches=0,
+                batch_keys_count=0,
+                phase="tasks_found",
+                missing_count=task_stats["missing_count"],
+                ai_count=task_stats["ai_count"],
+                locked_count=task_stats["locked_count"],
+                total_tasks=task_stats["total_tasks"],
+                mode=mode,
+            )
+            if _report(progress):
+                return
+
+        logger.info(f"Starting translation for {lang_name} ({lang_code}) - {tasks_count} items")
+
+        # Record token usage before translation
+        lang_token_start = ai_service.get_total_token_usage()
+
+        # Prepare texts with protected terms and variables
+        key_text_pairs: List[tuple] = []
+        protected_maps: Dict[str, Dict[str, str]] = {}
+        variable_maps: Dict[str, set] = {}
+        string_id_map: Dict[str, int] = {}
+
+        for task in tasks:
+            key_path = task["key_path"]
+            source_text = task["source_text"]
+            string_id_map[key_path] = task["id"]
+
+            # Apply protected terms (filtered by key_path)
+            filtered_protected_terms = get_all_protected_terms_flat(
+                self.project_id, key_path=key_path
+            )
+            if filtered_protected_terms:
+                protected_text, placeholder_map = apply_protection(source_text, filtered_protected_terms)
+                if placeholder_map:
+                    protected_maps[key_path] = placeholder_map
+            else:
+                protected_text = source_text
+
+            # Keep native variables (do NOT replace with placeholders on first attempt)
+            final_text = protected_text
+
+            # Detect variables for later validation
+            source_variables = self._extract_variables(source_text)
+            if source_variables:
+                variable_maps[key_path] = source_variables
+                logger.debug(f"Detected {len(source_variables)} variables in: {source_text[:50]}...")
+
+            key_text_pairs.append((key_path, final_text))
+
+        # Chunk by word count
+        chunk_size = chunk_size_words if chunk_size_words is not None else DEFAULT_CHUNK_SIZE_WORDS
+        chunks = chunk_with_keys(key_text_pairs, max_words=chunk_size)
+        total_batches = len(chunks)
+        logger.info(f"Split into {total_batches} chunks for {lang_name} ({lang_code}) (chunk size: {chunk_size} words)")
+
+        # Send "starting" progress
+        logger.info(f"Starting translation for {lang_name} ({lang_code}) - {len(tasks)} items in {total_batches} batches")
+        if progress_callback:
+            progress = TranslationProgress(
+                current_language=lang_code,
+                current_language_name=lang_name,
+                total_languages=total_languages,
+                completed_languages=ctx.get_completed_languages(),
+                current_item=ctx.get_counts()["processed_items"],
+                total_items=ctx.total_items,
+                current_key="",
+                current_text="",
+                success_count=ctx.get_counts()["translated_count"],
+                failure_count=ctx.get_counts()["failure_count"],
+                current_batch=0,
+                total_batches=total_batches,
+                batch_keys_count=0,
+                phase="starting",
+            )
+            if _report(progress):
+                return
+
+        # Translate chunks sequentially (within this language)
+        def _chunk_progress_callback(progress: TranslationProgress) -> bool:
+            if _should_stop():
+                return True
+            counts = ctx.get_counts()
+            progress.completed_languages = counts["completed_languages"]
+            progress.current_item = counts["processed_items"]
+            progress.total_items = ctx.total_items
+            progress.success_count = counts["translated_count"]
+            progress.failure_count = counts["failure_count"]
+            if not progress.total_batches or progress.total_batches == 0:
+                progress.total_batches = total_batches
+            return _report(progress)
+
+        chunk_results = translate_chunks_sequential_with_progress(
+            chunks=chunks,
+            source_lang=source_language,
+            target_lang=lang_code,
+            context=context,
+            ai_service=ai_service,
+            cancel_check=_should_stop,
+            progress_callback=_chunk_progress_callback,
+            lang_code=lang_code,
+            lang_name=lang_name,
+            total_languages=total_languages,
+            completed_languages=ctx.get_completed_languages(),
+            total_batches=total_batches,
+            processed_items=ctx.get_counts()["processed_items"],
+            total_items=ctx.total_items,
+            translated_count=ctx.get_counts()["translated_count"],
+            failure_count=ctx.get_counts()["failure_count"],
+        )
+
+        # Process results: validate and collect failed items for retry
+        valid_translations: List[Dict[str, Any]] = []
+        failed_validations: List[Dict[str, Any]] = []
+        placeholder_fallback_items: List[Dict[str, Any]] = []
+
+        for chunk_idx, (chunk, translated_texts) in enumerate(zip(chunks, chunk_results)):
+            for (key_path, original_text), translated_text in zip(chunk, translated_texts):
+                if _should_stop():
+                    return
+
+                original_source = next(
+                    (t["source_text"] for t in tasks if t["key_path"] == key_path),
+                    original_text
+                )
+
+                protected_vars = protected_maps.get(key_path)
+                source_variables = variable_maps.get(key_path)
+
+                # Restore protected terms
+                restored_text = translated_text
+                if protected_vars:
+                    restored_text = restore_protection(restored_text, protected_vars)
+
+                # Basic validation
+                is_valid, error_reason = self._validate_translation_result(
+                    source_text=original_source,
+                    translated_text=restored_text,
+                    source_lang=source_language,
+                    target_lang=lang_code,
+                    protected_vars=protected_vars,
+                    variable_placeholders=None,
+                    key_path=key_path,
+                )
+
+                if not is_valid:
+                    logger.warning(f"[INVALID] {key_path}: {error_reason}")
+                    failed_validations.append({
+                        "key_path": key_path,
+                        "string_id": string_id_map[key_path],
+                        "original_text": original_source,
+                        "protected_text": original_text,
+                        "protected_vars": protected_vars,
+                        "source_variables": source_variables,
+                        "error_reason": error_reason,
+                    })
+                    continue
+
+                # Native variable validation
+                if source_variables:
+                    vars_valid, vars_error = self._validate_native_variables_preserved(
+                        original_source, restored_text
+                    )
+                    if not vars_valid:
+                        logger.warning(f"[FALLBACK] {key_path}: {vars_error}, will retry with placeholders")
+                        placeholder_fallback_items.append({
+                            "key_path": key_path,
+                            "string_id": string_id_map[key_path],
+                            "original_text": original_source,
+                            "protected_vars": protected_vars,
+                            "source_variables": source_variables,
+                        })
+                        continue
+
+                # All validations passed
+                logger.debug(f"[VALID] {key_path}: translation passed all checks")
+                valid_translations.append({
+                    "key_path": key_path,
+                    "string_id": string_id_map[key_path],
+                    "translated_text": restored_text,
+                    "original_text": original_source,
+                })
+
+        # Placeholder fallback: retry items where native variables were lost
+        if placeholder_fallback_items:
+            logger.info(f"Processing {len(placeholder_fallback_items)} items with placeholder fallback method")
+            for idx, item in enumerate(placeholder_fallback_items):
+                key_path = item["key_path"]
+                source_text = item["original_text"]
+
+                protected_text, var_map = self._replace_variables_with_placeholders(source_text)
+                logger.debug(f"Fallback for {key_path}: replacing {len(var_map)} variables with placeholders")
+
+                protected_vars = item.get("protected_vars", {})
+                if protected_vars:
+                    for placeholder, term in protected_vars.items():
+                        protected_text = protected_text.replace(term, placeholder)
+
+                try:
+                    translated_texts = ai_service.translate_array(
+                        [protected_text], source_language, lang_code, context
+                    )
+                    translated = translated_texts[0] if translated_texts else ""
+                except Exception as e:
+                    logger.error(f"Fallback translation failed for {key_path}: {e}")
+                    ctx.add_failure(1)
+                    continue
+
+                restored = self._restore_variables_from_placeholders(translated, var_map)
+                if protected_vars:
+                    restored = restore_protection(restored, protected_vars)
+
+                is_valid, error_reason = self._validate_translation_result(
+                    source_text=source_text,
+                    translated_text=restored,
+                    source_lang=source_language,
+                    target_lang=lang_code,
+                    protected_vars=protected_vars,
+                    variable_placeholders=var_map,
+                    key_path=key_path,
+                )
+
+                if is_valid:
+                    valid_translations.append({
+                        "key_path": key_path,
+                        "string_id": item["string_id"],
+                        "translated_text": restored,
+                        "original_text": source_text,
+                    })
+                    logger.info(f"✓ Fallback succeeded for {key_path}")
+                else:
+                    logger.warning(f"Fallback validation failed for {key_path}: {error_reason}")
+                    ctx.add_failure(1)
+
+        # Retry failed validations once
+        if failed_validations:
+            logger.info(f"Retrying {len(failed_validations)} failed validations for {lang_code}")
+
+            if progress_callback:
+                progress = TranslationProgress(
+                    current_language=lang_code,
+                    current_language_name=lang_name,
+                    total_languages=total_languages,
+                    completed_languages=ctx.get_completed_languages(),
+                    current_item=ctx.get_counts()["processed_items"],
+                    total_items=ctx.total_items,
+                    current_key="",
+                    current_text="",
+                    success_count=ctx.get_counts()["translated_count"],
+                    failure_count=ctx.get_counts()["failure_count"],
+                    current_batch=0,
+                    total_batches=total_batches,
+                    batch_keys_count=0,
+                    phase="retrying",
+                    retry_keys_count=len(failed_validations),
+                )
+                if _report(progress):
+                    return
+
+            retry_pairs = [(item["key_path"], item["protected_text"]) for item in failed_validations]
+            chunk_size = chunk_size_words if chunk_size_words is not None else DEFAULT_CHUNK_SIZE_WORDS
+            retry_chunks = chunk_with_keys(retry_pairs, max_words=chunk_size)
+
+            retry_results = translate_chunks_sequential(
+                chunks=retry_chunks,
+                source_lang=source_language,
+                target_lang=lang_code,
+                context=context,
+                ai_service=ai_service,
+                cancel_check=_should_stop,
+            )
+
+            retry_idx = 0
+            for retry_chunk, retry_translated in zip(retry_chunks, retry_results):
+                if _should_stop():
+                    return
+
+                for (key_path, _), new_translation in zip(retry_chunk, retry_translated):
+                    item = failed_validations[retry_idx]
+                    retry_idx += 1
+
+                    protected_vars = item.get("protected_vars")
+                    source_variables = item.get("source_variables")
+                    restored_text = new_translation
+                    if protected_vars:
+                        restored_text = restore_protection(restored_text, protected_vars)
+
+                    is_valid, error_reason = self._validate_translation_result(
+                        source_text=item["original_text"],
+                        translated_text=restored_text,
+                        source_lang=source_language,
+                        target_lang=lang_code,
+                        protected_vars=protected_vars,
+                        variable_placeholders=None,
+                        key_path=key_path,
+                    )
+
+                    if is_valid and source_variables:
+                        vars_valid, vars_error = self._validate_native_variables_preserved(
+                            item["original_text"], restored_text
+                        )
+                        if not vars_valid:
+                            is_valid = False
+                            error_reason = vars_error
+
+                    if is_valid:
+                        valid_translations.append({
+                            "key_path": key_path,
+                            "string_id": item["string_id"],
+                            "translated_text": restored_text,
+                            "original_text": item["original_text"],
+                        })
+                        logger.info(f"✓ Retry succeeded for {key_path}")
+                    else:
+                        ctx.add_failure(1)
+                        ctx.append_failed_item({
+                            "language_code": lang_code,
+                            "language_name": lang_name,
+                            "key_path": key_path,
+                            "source_text": item["original_text"],
+                            "error": f"validation_failed:{error_reason}",
+                        })
+                        logger.error(f"✗ Retry failed for {key_path}: {error_reason}")
+
+        # Send "saving" phase
+        lang_success_count = len(valid_translations)
+        lang_failure_count = len(failed_validations) - sum(
+            1 for item in failed_validations
+            if any(v["key_path"] == item["key_path"] for v in valid_translations)
+        )
+        if progress_callback:
+            progress = TranslationProgress(
+                current_language=lang_code,
+                current_language_name=lang_name,
+                total_languages=total_languages,
+                completed_languages=ctx.get_completed_languages(),
+                current_item=ctx.get_counts()["processed_items"],
+                total_items=ctx.total_items,
+                current_key="",
+                current_text="",
+                success_count=lang_success_count,
+                failure_count=lang_failure_count,
+                current_batch=0,
+                total_batches=total_batches,
+                batch_keys_count=0,
+                phase="saving",
+            )
+            if _report(progress):
+                return
+
+        # Save valid translations to database
+        if valid_translations:
+            db_items = [
+                {
+                    "string_id": item["string_id"],
+                    "translated_text": item["translated_text"]
+                }
+                for item in valid_translations
+            ]
+            db_writer.enqueue_and_flush(
+                project_id=self.project_id,
+                language_code=lang_code,
+                items=db_items,
+                status="ai_translated",
+                model=model_override,
+                provider=ai_provider,
+            )
+            ctx.add_translated(len(valid_translations))
+            ctx.add_processed_items(len(valid_translations))
+
+        for item in valid_translations:
+            if _should_stop():
+                return
+            logger.debug(f"✓ Saved translation for {item['key_path']}")
+
+        # Calculate token usage for this language
+        lang_token_end = ai_service.get_total_token_usage()
+        lang_token_usage = {
+            "prompt_tokens": lang_token_end["prompt_tokens"] - lang_token_start["prompt_tokens"],
+            "completion_tokens": lang_token_end["completion_tokens"] - lang_token_start["completion_tokens"],
+        }
+
+        ctx.add_token_usage(lang_token_usage)
+
+        lang_final_success = sum(1 for item in valid_translations
+                                if not any(f["key_path"] == item["key_path"]
+                                           for f in ctx.failed_items if f["language_code"] == lang_code))
+        lang_final_failure = len(tasks) - lang_final_success
+
+        logger.info(f"Translation completed for {lang_name} ({lang_code}): {lang_final_success} succeeded, {lang_final_failure} failed (tokens: {lang_token_usage})")
+
+        lang_failed_items = [
+            item for item in ctx.failed_items
+            if item.get("language_code") == lang_code
+        ]
+
+        completed_count = ctx.increment_completed_languages()
+
+        if progress_callback:
+            progress = TranslationProgress(
+                current_language=lang_code,
+                current_language_name=lang_name,
+                total_languages=total_languages,
+                completed_languages=completed_count,
+                current_item=ctx.get_counts()["processed_items"],
+                total_items=ctx.total_items,
+                current_key="",
+                current_text="",
+                success_count=lang_final_success,
+                failure_count=lang_final_failure,
+                current_batch=0,
+                total_batches=total_batches,
+                batch_keys_count=0,
+                phase="completed",
+                token_usage=lang_token_usage,
+                failed_items=lang_failed_items if lang_failed_items else None,
+            )
+            _report(progress)
+
+        # Generate file for this language
+        if generate_files:
+            try:
+                logger.info(f"Generating language file for {lang_name} ({lang_code}) after translation...")
+                output_path = locales_path / f"{lang_code}.json"
+                file_generator.generate_language_file(self.project_id, lang_code, output_path)
+                ctx.set_generated_file(lang_code, str(output_path))
+                logger.info(f"Generated file for {lang_code}: {output_path}")
+
+                if progress_callback:
+                    progress = TranslationProgress(
+                        current_language=lang_code,
+                        current_language_name=lang_name,
+                        total_languages=total_languages,
+                        completed_languages=completed_count,
+                        current_item=ctx.get_counts()["processed_items"],
+                        total_items=ctx.total_items,
+                        current_key="",
+                        current_text="",
+                        success_count=ctx.get_counts()["translated_count"],
+                        failure_count=ctx.get_counts()["failure_count"],
+                        current_batch=0,
+                        total_batches=0,
+                        batch_keys_count=0,
+                        phase="file_generated",
+                    )
+                    _report(progress)
+            except Exception as e:
+                logger.error(f"Failed to generate file for {lang_code}: {e}")
+
     def translate_all_missing_chunked(
         self,
         progress_callback: Optional[Callable[[TranslationProgress], None]] = None,
@@ -365,11 +1120,8 @@ class TranslationManager:
         """
         Translate all missing translations using chunked approach.
 
-        This method uses a chunked translation approach:
-        1. Collect all texts for a language
-        2. Chunk by word count
-        3. Translate chunks sequentially
-        4. Graceful fallback on failure (return original text)
+        Target languages are translated concurrently (up to language_concurrency).
+        Within each language, chunks are still translated sequentially.
 
         Args:
             progress_callback: Optional callback for progress updates
@@ -385,10 +1137,6 @@ class TranslationManager:
         Returns:
             Dict with results including success status, counts, and generated files
         """
-        # Import here to avoid circular imports
-        from src.translation.utils import chunk_with_keys
-        import src.project.generator as file_generator
-
         logger.info(f"Starting chunked translation for project {self.project_id}")
         if model_override:
             logger.info(f"Using model override: {model_override}")
@@ -399,658 +1147,106 @@ class TranslationManager:
 
         languages = self._resolve_target_languages(target_languages)
         total_languages = len(languages)
+        if total_languages == 0:
+            return self._build_result(0, 0, {}, token_usage={"prompt_tokens": 0, "completion_tokens": 0})
 
-        processed_items = 0
-        translated_count = 0
-        failure_count = 0
-        generated_files: Dict[str, str] = {}
-        total_items = 0
-
-        # Initialize AI service
-        ai_service = AIService(model_override=model_override, provider_override=ai_provider)
         source_language = self.project["source_language"]
         context = self.project.get("translation_context", "")
         locales_path = Path(self.project["locales_path"])
 
-        # Track token usage per language and total
-        token_usage_by_language: Dict[str, Dict[str, int]] = {}
-        total_token_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        # Load translation config to get language_concurrency
+        translation_config = load_config().get("translation", {})
+        max_concurrency = translation_config.get("language_concurrency", DEFAULT_LANGUAGE_CONCURRENCY)
 
-        # Process each language completely before moving to the next
-        for lang_idx, lang_code in enumerate(languages):
-            # Check for cancellation
-            if cancel_check and cancel_check():
-                logger.info("Translation cancelled by user request")
-                return self._build_result(translated_count, failure_count, generated_files, cancelled=True, token_usage=total_token_usage)
-
-            lang_name = lc.get_language_name(lang_code) or lang_code
-
-            # Phase 1: Send "checking" progress
-            logger.info(f"Checking {lang_name} ({lang_code}) for pending translations...")
-            if progress_callback:
-                progress = TranslationProgress(
-                    current_language=lang_code,
-                    current_language_name=lang_name,
-                    total_languages=total_languages,
-                    completed_languages=lang_idx,
-                    current_item=processed_items,
-                    total_items=total_items,
-                    current_key="",
-                    current_text="",
-                    success_count=translated_count,
-                    failure_count=failure_count,
-                    current_batch=0,
-                    total_batches=0,
-                    batch_keys_count=0,
-                    phase="checking",
-                )
-                if progress_callback(progress):
-                    return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
-
-            # Phase 2: Check for pending tasks
+        # Pre-calculate total items across all target languages
+        total_items = 0
+        for lang_code in languages:
             tasks = self._get_tasks_for_language(lang_code, mode=mode, include_locked=include_locked)
-
-            # Get language statistics for briefing
-            try:
-                lang_stats = validation.get_translation_stats(self.project_id, lang_code)
-                total_keys = lang_stats.total_strings
-                completed_keys = lang_stats.translated_count
-                missing_keys = lang_stats.missing_count
-            except Exception as e:
-                logger.warning(f"Failed to get stats for {lang_code}: {e}")
-                total_keys = len(tasks) if tasks else 0
-                completed_keys = 0
-                missing_keys = len(tasks) if tasks else 0
-
-            # Send "checked" phase with statistics
-            logger.info(f"Checked {lang_name} ({lang_code}): Total: {total_keys}, Completed: {completed_keys}, Missing: {missing_keys}")
-            if progress_callback:
-                progress = TranslationProgress(
-                    current_language=lang_code,
-                    current_language_name=lang_name,
-                    total_languages=total_languages,
-                    completed_languages=lang_idx,
-                    current_item=processed_items,
-                    total_items=total_keys,
-                    current_key="",
-                    current_text="",
-                    success_count=completed_keys,
-                    failure_count=missing_keys,
-                    current_batch=0,
-                    total_batches=0,
-                    batch_keys_count=0,
-                    phase="checked",
-                    mode=mode,
-                )
-                if progress_callback(progress):
-                    return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
-
-            if not tasks:
-                # No tasks for this language
-                logger.info(f"No pending translations for {lang_code}")
-                logger.info(f"All translations complete for {lang_name} ({lang_code})")
-
-                task_stats = self._get_task_statistics(lang_code, mode=mode, include_locked=include_locked)
-
-                # Send "no_work" progress
-                if progress_callback:
-                    progress = TranslationProgress(
-                        current_language=lang_code,
-                        current_language_name=lang_name,
-                        total_languages=total_languages,
-                        completed_languages=lang_idx,
-                        current_item=processed_items,
-                        total_items=total_items,
-                        current_key="",
-                        current_text="",
-                        success_count=translated_count,
-                        failure_count=failure_count,
-                        current_batch=0,
-                        total_batches=0,
-                        batch_keys_count=0,
-                        phase="no_work",
-                        missing_count=task_stats["missing_count"],
-                        ai_count=task_stats["ai_count"],
-                        locked_count=task_stats["locked_count"],
-                        total_tasks=task_stats["total_tasks"],
-                        mode=mode,
-                    )
-                    if progress_callback(progress):
-                        return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
-
-                # Generate file for this language
-                if generate_files:
-                    try:
-                        logger.info(f"Generating language file for {lang_name} ({lang_code})...")
-                        output_path = locales_path / f"{lang_code}.json"
-                        file_generator.generate_language_file(self.project_id, lang_code, output_path)
-                        generated_files[lang_code] = str(output_path)
-                        logger.info(f"Generated file for {lang_code}: {output_path}")
-
-                        if progress_callback:
-                            progress = TranslationProgress(
-                                current_language=lang_code,
-                                current_language_name=lang_name,
-                                total_languages=total_languages,
-                                completed_languages=lang_idx + 1,
-                                current_item=processed_items,
-                                total_items=total_items,
-                                current_key="",
-                                current_text="",
-                                success_count=translated_count,
-                                failure_count=failure_count,
-                                current_batch=0,
-                                total_batches=0,
-                                batch_keys_count=0,
-                                phase="file_generated",
-                            )
-                            progress_callback(progress)
-                    except Exception as e:
-                        logger.error(f"Failed to generate file for {lang_code}: {e}")
-
-                # Send "completed" phase for no_work case
-                if progress_callback:
-                    progress = TranslationProgress(
-                        current_language=lang_code,
-                        current_language_name=lang_name,
-                        total_languages=total_languages,
-                        completed_languages=lang_idx + 1,
-                        current_item=processed_items,
-                        total_items=total_items,
-                        current_key="",
-                        current_text="",
-                        success_count=0,
-                        failure_count=0,
-                        current_batch=0,
-                        total_batches=0,
-                        batch_keys_count=0,
-                        phase="completed",
-                    )
-                    progress_callback(progress)
-
-                continue
-
-            # Has tasks - proceed with translation
             total_items += len(tasks)
-            tasks_count = len(tasks)
 
-            task_stats = self._get_task_statistics(lang_code, mode=mode, include_locked=include_locked)
+        # Initialize thread-safe context
+        ctx = _TranslationJobContext(total_items=total_items)
 
-            # Send "tasks_found" phase
-            logger.info(f"Found {tasks_count} keys to translate for {lang_name} ({lang_code})")
-            if progress_callback:
-                progress = TranslationProgress(
-                    current_language=lang_code,
-                    current_language_name=lang_name,
+        # Helper to check cancellation
+        def _should_stop() -> bool:
+            if ctx.is_cancelled():
+                return True
+            if cancel_check and cancel_check():
+                ctx.request_cancel()
+                return True
+            return False
+
+        # Target language thread worker function
+        def _worker(lang_code: str, lang_idx: int) -> None:
+            try:
+                self._translate_single_language(
+                    lang_code=lang_code,
+                    lang_idx=lang_idx,
                     total_languages=total_languages,
-                    completed_languages=lang_idx,
-                    current_item=processed_items,
-                    total_items=tasks_count,
-                    current_key="",
-                    current_text="",
-                    success_count=0,
-                    failure_count=0,
-                    current_batch=0,
-                    total_batches=0,
-                    batch_keys_count=0,
-                    phase="tasks_found",
-                    missing_count=task_stats["missing_count"],
-                    ai_count=task_stats["ai_count"],
-                    locked_count=task_stats["locked_count"],
-                    total_tasks=task_stats["total_tasks"],
+                    ctx=ctx,
                     mode=mode,
-                )
-                if progress_callback(progress):
-                    return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
-
-            logger.info(f"Starting translation for {lang_name} ({lang_code}) - {tasks_count} items")
-
-            # Record token usage before translation
-            lang_token_start = ai_service.get_total_token_usage()
-
-            # Prepare texts with protected terms and variables
-            key_text_pairs: List[tuple] = []
-            protected_maps: Dict[str, Dict[str, str]] = {}
-            variable_maps: Dict[str, set] = {}
-            string_id_map: Dict[str, int] = {}
-
-            for task in tasks:
-                key_path = task["key_path"]
-                source_text = task["source_text"]
-                string_id_map[key_path] = task["id"]
-
-                # Apply protected terms (filtered by key_path)
-                filtered_protected_terms = get_all_protected_terms_flat(
-                    self.project_id, key_path=key_path
-                )
-                if filtered_protected_terms:
-                    protected_text, placeholder_map = apply_protection(source_text, filtered_protected_terms)
-                    if placeholder_map:
-                        protected_maps[key_path] = placeholder_map
-                else:
-                    protected_text = source_text
-
-                # Keep native variables (do NOT replace with placeholders on first attempt)
-                final_text = protected_text
-
-                # Detect variables for later validation
-                source_variables = self._extract_variables(source_text)
-                if source_variables:
-                    variable_maps[key_path] = source_variables
-                    logger.debug(f"Detected {len(source_variables)} variables in: {source_text[:50]}...")
-
-                key_text_pairs.append((key_path, final_text))
-
-            # Chunk by word count
-            chunk_size = chunk_size_words if chunk_size_words is not None else DEFAULT_CHUNK_SIZE_WORDS
-            chunks = chunk_with_keys(key_text_pairs, max_words=chunk_size)
-            total_batches = len(chunks)
-            logger.info(f"Split into {total_batches} chunks for {lang_name} ({lang_code}) (chunk size: {chunk_size} words)")
-
-            # Send "starting" progress
-            logger.info(f"Starting translation for {lang_name} ({lang_code}) - {len(tasks)} items in {total_batches} batches")
-            if progress_callback:
-                progress = TranslationProgress(
-                    current_language=lang_code,
-                    current_language_name=lang_name,
-                    total_languages=total_languages,
-                    completed_languages=lang_idx,
-                    current_item=processed_items,
-                    total_items=total_items,
-                    current_key="",
-                    current_text="",
-                    success_count=translated_count,
-                    failure_count=failure_count,
-                    current_batch=0,
-                    total_batches=total_batches,
-                    batch_keys_count=0,
-                    phase="starting",
-                )
-                if progress_callback(progress):
-                    return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
-
-            # Translate chunks sequentially
-            chunk_results = translate_chunks_sequential_with_progress(
-                chunks=chunks,
-                source_lang=source_language,
-                target_lang=lang_code,
-                context=context,
-                ai_service=ai_service,
-                cancel_check=cancel_check,
-                progress_callback=progress_callback,
-                lang_code=lang_code,
-                lang_name=lang_name,
-                total_languages=total_languages,
-                completed_languages=lang_idx,
-                total_batches=total_batches,
-                processed_items=processed_items,
-                total_items=total_items,
-                translated_count=translated_count,
-                failure_count=failure_count,
-            )
-
-            # Process results: validate and collect failed items for retry
-            valid_translations: List[Dict[str, Any]] = []
-            failed_validations: List[Dict[str, Any]] = []
-            placeholder_fallback_items: List[Dict[str, Any]] = []
-
-            for chunk_idx, (chunk, translated_texts) in enumerate(zip(chunks, chunk_results)):
-                for (key_path, original_text), translated_text in zip(chunk, translated_texts):
-                    if cancel_check and cancel_check():
-                        return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
-
-                    original_source = next(
-                        (t["source_text"] for t in tasks if t["key_path"] == key_path),
-                        original_text
-                    )
-
-                    protected_vars = protected_maps.get(key_path)
-                    source_variables = variable_maps.get(key_path)
-
-                    # Restore protected terms
-                    restored_text = translated_text
-                    if protected_vars:
-                        restored_text = restore_protection(restored_text, protected_vars)
-
-                    # Basic validation
-                    is_valid, error_reason = self._validate_translation_result(
-                        source_text=original_source,
-                        translated_text=restored_text,
-                        source_lang=source_language,
-                        target_lang=lang_code,
-                        protected_vars=protected_vars,
-                        variable_placeholders=None,
-                        key_path=key_path,
-                    )
-
-                    if not is_valid:
-                        logger.warning(f"[INVALID] {key_path}: {error_reason}")
-                        failed_validations.append({
-                            "key_path": key_path,
-                            "string_id": string_id_map[key_path],
-                            "original_text": original_source,
-                            "protected_text": original_text,
-                            "protected_vars": protected_vars,
-                            "source_variables": source_variables,
-                            "error_reason": error_reason,
-                        })
-                        continue
-
-                    # Native variable validation
-                    if source_variables:
-                        vars_valid, vars_error = self._validate_native_variables_preserved(
-                            original_source, restored_text
-                        )
-                        if not vars_valid:
-                            logger.warning(f"[FALLBACK] {key_path}: {vars_error}, will retry with placeholders")
-                            placeholder_fallback_items.append({
-                                "key_path": key_path,
-                                "string_id": string_id_map[key_path],
-                                "original_text": original_source,
-                                "protected_vars": protected_vars,
-                                "source_variables": source_variables,
-                            })
-                            continue
-
-                    # All validations passed
-                    logger.debug(f"[VALID] {key_path}: translation passed all checks")
-                    valid_translations.append({
-                        "key_path": key_path,
-                        "string_id": string_id_map[key_path],
-                        "translated_text": restored_text,
-                        "original_text": original_source,
-                    })
-
-            # Placeholder fallback: retry items where native variables were lost
-            if placeholder_fallback_items:
-                logger.info(f"Processing {len(placeholder_fallback_items)} items with placeholder fallback method")
-                for idx, item in enumerate(placeholder_fallback_items):
-                    key_path = item["key_path"]
-                    source_text = item["original_text"]
-
-                    protected_text, var_map = self._replace_variables_with_placeholders(source_text)
-                    logger.debug(f"Fallback for {key_path}: replacing {len(var_map)} variables with placeholders")
-
-                    protected_vars = item.get("protected_vars", {})
-                    if protected_vars:
-                        for placeholder, term in protected_vars.items():
-                            protected_text = protected_text.replace(term, placeholder)
-
-                    try:
-                        translated_texts = ai_service.translate_array(
-                            [protected_text], source_language, lang_code, context
-                        )
-                        translated = translated_texts[0] if translated_texts else ""
-                    except Exception as e:
-                        logger.error(f"Fallback translation failed for {key_path}: {e}")
-                        failure_count += 1
-                        continue
-
-                    restored = self._restore_variables_from_placeholders(translated, var_map)
-                    if protected_vars:
-                        restored = restore_protection(restored, protected_vars)
-
-                    is_valid, error_reason = self._validate_translation_result(
-                        source_text=source_text,
-                        translated_text=restored,
-                        source_lang=source_language,
-                        target_lang=lang_code,
-                        protected_vars=protected_vars,
-                        variable_placeholders=var_map,
-                        key_path=key_path,
-                    )
-
-                    if is_valid:
-                        valid_translations.append({
-                            "key_path": key_path,
-                            "string_id": item["string_id"],
-                            "translated_text": restored,
-                            "original_text": source_text,
-                        })
-                        logger.info(f"✓ Fallback succeeded for {key_path}")
-                    else:
-                        logger.warning(f"Fallback validation failed for {key_path}: {error_reason}")
-                        failure_count += 1
-
-            # Retry failed validations once
-            if failed_validations:
-                logger.info(f"Retrying {len(failed_validations)} failed validations for {lang_code}")
-
-                if progress_callback:
-                    progress = TranslationProgress(
-                        current_language=lang_code,
-                        current_language_name=lang_name,
-                        total_languages=total_languages,
-                        completed_languages=lang_idx,
-                        current_item=processed_items,
-                        total_items=total_items,
-                        current_key="",
-                        current_text="",
-                        success_count=translated_count,
-                        failure_count=failure_count,
-                        current_batch=0,
-                        total_batches=total_batches,
-                        batch_keys_count=0,
-                        phase="retrying",
-                        retry_keys_count=len(failed_validations),
-                    )
-                    if progress_callback(progress):
-                        return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
-
-                retry_pairs = [(item["key_path"], item["protected_text"]) for item in failed_validations]
-                chunk_size = chunk_size_words if chunk_size_words is not None else DEFAULT_CHUNK_SIZE_WORDS
-                retry_chunks = chunk_with_keys(retry_pairs, max_words=chunk_size)
-
-                retry_results = translate_chunks_sequential(
-                    chunks=retry_chunks,
-                    source_lang=source_language,
-                    target_lang=lang_code,
+                    include_locked=include_locked,
+                    generate_files=generate_files,
+                    source_language=source_language,
                     context=context,
-                    ai_service=ai_service,
+                    locales_path=locales_path,
+                    chunk_size_words=chunk_size_words,
+                    model_override=model_override,
+                    ai_provider=ai_provider,
+                    progress_callback=progress_callback,
                     cancel_check=cancel_check,
                 )
+            except Exception as exc:
+                logger.error(f"Worker thread for language {lang_code} failed: {exc}", exc_info=True)
+                ctx.set_fatal_error(exc)
 
-                retry_idx = 0
-                for retry_chunk, retry_translated in zip(retry_chunks, retry_results):
-                    if cancel_check and cancel_check():
-                        return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
+        # Start thread pool executor
+        max_workers = min(max_concurrency, total_languages)
+        logger.info(f"Translating {total_languages} languages with concurrency={max_workers} (total items={total_items})")
 
-                    for (key_path, _), new_translation in zip(retry_chunk, retry_translated):
-                        item = failed_validations[retry_idx]
-                        retry_idx += 1
+        if _should_stop():
+            return self._build_result(0, 0, {}, cancelled=True, token_usage=ctx.total_token_usage)
 
-                        protected_vars = item.get("protected_vars")
-                        source_variables = item.get("source_variables")
-                        restored_text = new_translation
-                        if protected_vars:
-                            restored_text = restore_protection(restored_text, protected_vars)
-
-                        is_valid, error_reason = self._validate_translation_result(
-                            source_text=item["original_text"],
-                            translated_text=restored_text,
-                            source_lang=source_language,
-                            target_lang=lang_code,
-                            protected_vars=protected_vars,
-                            variable_placeholders=None,
-                            key_path=key_path,
-                        )
-
-                        if is_valid and source_variables:
-                            vars_valid, vars_error = self._validate_native_variables_preserved(
-                                item["original_text"], restored_text
-                            )
-                            if not vars_valid:
-                                is_valid = False
-                                error_reason = vars_error
-
-                        if is_valid:
-                            valid_translations.append({
-                                "key_path": key_path,
-                                "string_id": item["string_id"],
-                                "translated_text": restored_text,
-                                "original_text": item["original_text"],
-                            })
-                            logger.info(f"✓ Retry succeeded for {key_path}")
-                        else:
-                            failure_count += 1
-                            self.failed_items.append({
-                                "language_code": lang_code,
-                                "language_name": lang_name,
-                                "key_path": key_path,
-                                "source_text": item["original_text"],
-                                "error": f"validation_failed:{error_reason}",
-                            })
-                            logger.error(f"✗ Retry failed for {key_path}: {error_reason}")
-
-            # Send "saving" phase
-            lang_success_count = len(valid_translations)
-            lang_failure_count = len(failed_validations) - sum(
-                1 for item in failed_validations
-                if any(v["key_path"] == item["key_path"] for v in valid_translations)
-            )
-            if progress_callback:
-                progress = TranslationProgress(
-                    current_language=lang_code,
-                    current_language_name=lang_name,
-                    total_languages=total_languages,
-                    completed_languages=lang_idx,
-                    current_item=processed_items,
-                    total_items=total_items,
-                    current_key="",
-                    current_text="",
-                    success_count=lang_success_count,
-                    failure_count=lang_failure_count,
-                    current_batch=0,
-                    total_batches=total_batches,
-                    batch_keys_count=0,
-                    phase="saving",
-                )
-                if progress_callback(progress):
-                    return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
-
-            # Save valid translations to database
-            for item in valid_translations:
-                if cancel_check and cancel_check():
-                    return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
-
-                processed_items += 1
-                if progress_callback:
-                    elapsed = time.time() - self.start_time
-                    avg_time = elapsed / max(processed_items, 1)
-                    remaining = (total_items - processed_items) * avg_time
-
-                    progress = TranslationProgress(
-                        current_language=lang_code,
-                        current_language_name=lang_name,
-                        total_languages=total_languages,
-                        completed_languages=lang_idx,
-                        current_item=processed_items,
-                        total_items=total_items,
-                        current_key=item["key_path"],
-                        current_text=item["original_text"],
-                        success_count=translated_count,
-                        failure_count=failure_count,
-                        estimated_time_remaining=remaining,
-                        phase="saving",
-                    )
-                    if progress_callback(progress):
-                        return self._build_result(translated_count, failure_count, generated_files, cancelled=True)
-
-                try:
-                    db.create_translation(
-                        string_id=item["string_id"],
-                        language_code=lang_code,
-                        translated_text=item["translated_text"],
-                        status="ai_translated",
-                    )
-                    translated_count += 1
-                    logger.debug(f"✓ Saved translation for {item['key_path']}")
-                except Exception as e:
-                    failure_count += 1
-                    self.failed_items.append({
-                        "language_code": lang_code,
-                        "language_name": lang_name,
-                        "key_path": item["key_path"],
-                        "source_text": item["original_text"],
-                        "error": str(e),
-                    })
-                    logger.error(f"✗ Failed to save translation for {item['key_path']}: {e}")
-
-            # Calculate token usage for this language
-            lang_token_end = ai_service.get_total_token_usage()
-            lang_token_usage = {
-                "prompt_tokens": lang_token_end["prompt_tokens"] - lang_token_start["prompt_tokens"],
-                "completion_tokens": lang_token_end["completion_tokens"] - lang_token_start["completion_tokens"],
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all translation tasks
+            futures = {
+                executor.submit(_worker, lang_code, lang_idx): lang_code
+                for lang_idx, lang_code in enumerate(languages)
             }
 
-            token_usage_by_language[lang_code] = lang_token_usage
-            total_token_usage["prompt_tokens"] += lang_token_usage["prompt_tokens"]
-            total_token_usage["completion_tokens"] += lang_token_usage["completion_tokens"]
-
-            lang_final_success = sum(1 for item in valid_translations
-                                    if not any(f["key_path"] == item["key_path"]
-                                               for f in self.failed_items if f["language_code"] == lang_code))
-            lang_final_failure = len(tasks) - lang_final_success
-
-            logger.info(f"Translation completed for {lang_name} ({lang_code}): {lang_final_success} succeeded, {lang_final_failure} failed (tokens: {lang_token_usage})")
-
-            lang_failed_items = [
-                item for item in self.failed_items
-                if item.get("language_code") == lang_code
-            ]
-
-            if progress_callback:
-                progress = TranslationProgress(
-                    current_language=lang_code,
-                    current_language_name=lang_name,
-                    total_languages=total_languages,
-                    completed_languages=lang_idx + 1,
-                    current_item=processed_items,
-                    total_items=total_items,
-                    current_key="",
-                    current_text="",
-                    success_count=lang_final_success,
-                    failure_count=lang_final_failure,
-                    current_batch=0,
-                    total_batches=total_batches,
-                    batch_keys_count=0,
-                    phase="completed",
-                    token_usage=lang_token_usage,
-                    failed_items=lang_failed_items if lang_failed_items else None,
-                )
-                progress_callback(progress)
-
-            # Generate file for this language
-            if generate_files:
+            # Wait for all futures to complete
+            for future in as_completed(futures):
+                lang_code = futures[future]
                 try:
-                    logger.info(f"Generating language file for {lang_name} ({lang_code}) after translation...")
-                    output_path = locales_path / f"{lang_code}.json"
-                    file_generator.generate_language_file(self.project_id, lang_code, output_path)
-                    generated_files[lang_code] = str(output_path)
-                    logger.info(f"Generated file for {lang_code}: {output_path}")
+                    future.result()
+                except Exception as exc:
+                    logger.error(f"Exception occurred in executor future for {lang_code}: {exc}")
+                    fatal = ctx.get_fatal_error()
+                    if fatal:
+                        # Cancel remaining pending tasks in the executor if possible
+                        for pending_future in futures:
+                            pending_future.cancel()
+                        raise fatal
 
-                    if progress_callback:
-                        progress = TranslationProgress(
-                            current_language=lang_code,
-                            current_language_name=lang_name,
-                            total_languages=total_languages,
-                            completed_languages=lang_idx + 1,
-                            current_item=processed_items,
-                            total_items=total_items,
-                            current_key="",
-                            current_text="",
-                            success_count=translated_count,
-                            failure_count=failure_count,
-                            current_batch=0,
-                            total_batches=0,
-                            batch_keys_count=0,
-                            phase="file_generated",
-                        )
-                        progress_callback(progress)
-                except Exception as e:
-                    logger.error(f"Failed to generate file for {lang_code}: {e}")
+        # Update manager state after threads finish
+        self.failed_items = ctx.failed_items
+        counts = ctx.get_counts()
 
-        return self._build_result(translated_count, failure_count, generated_files, token_usage=total_token_usage)
+        if ctx.is_cancelled():
+            return self._build_result(
+                counts["translated_count"],
+                counts["failure_count"],
+                ctx.generated_files,
+                cancelled=True,
+                token_usage=ctx.total_token_usage,
+            )
+
+        return self._build_result(
+            counts["translated_count"],
+            counts["failure_count"],
+            ctx.generated_files,
+            token_usage=ctx.total_token_usage,
+        )
 
     def validate_and_clear_invalid(
         self,

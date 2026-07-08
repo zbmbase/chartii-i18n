@@ -307,15 +307,18 @@ def apply_sync_changes(project_id: int, result: SyncResult):
             logger.debug(f"Updated string: {key_path} (id={string_id})")
 
             # Update translation statuses
-            # If translation is locked, mark as needs_review
-            # If translation is ai_translated, it will be re-translated
+            # If translation is locked, mark as needs_review (preserves user manual edits)
             cursor.execute("""
                 UPDATE translations
-                SET status = CASE
-                    WHEN status = 'locked' THEN 'needs_review'
-                    ELSE status
-                END
-                WHERE string_id = ?
+                SET status = 'needs_review'
+                WHERE string_id = ? AND status = 'locked'
+            """, (string_id,))
+
+            # Delete AI-generated translations because the source text has changed,
+            # ensuring they are flagged as missing and re-translated
+            cursor.execute("""
+                DELETE FROM translations
+                WHERE string_id = ? AND status = 'ai_translated'
             """, (string_id,))
 
         # Delete removed strings (delete translations first due to foreign key)
