@@ -1,3 +1,5 @@
+
+
 # CharTii-i18n
 
 <div align="center">
@@ -45,7 +47,6 @@ If you have successfully deployed CharTii-i18n for your project's multilingual s
 - [Usage Scenarios](#usage-scenarios)
 - [Configuration](#configuration)
 - [Project Structure](#project-structure)
-- [Contributing](#contributing)
 - [License](#license)
 
 ## Installation
@@ -66,7 +67,7 @@ cd chartii-i18n
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+source .venv/bin/activate  # On Windows: .venv\Scripts/activate
 ```
 
 ### Step 3: Install Dependencies
